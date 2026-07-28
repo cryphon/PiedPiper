@@ -13,12 +13,33 @@
 #define PIN_MISO    19  // Green
 #define PIN_MOSI    23  // Orange
 
+#define PKT_SIZE    37
+#define PAY_SIZE    32
 
-#define CMD_W_REGISTER 0x20
-#define CMD_R_REGISTER 0x00
-#define REG_RX_ADDR_P0 0x0A
+#define CMD_FLUSH_RX    0xE2
+#define EN_CRC_BIT (1 << 3)   // bit 3 of CONFIG
+
+
+#define CMD_W_REGISTER  0x20
+#define CMD_R_REGISTER  0x00
+#define REG_RX_ADDR_P0  0x0A
+                        
+#define REG_EN_AA       0x01       
+#define REG_EN_RXADDR   0x02
+#define REG_SETUP_AW    0x03
+#define REG_RF_SETUP    0x06
+#define REG_STATUS      0x07
+#define REG_RX_PW_P0    0x11
 
 spi_device_handle_t nrf;
+uint64_t prom_addr = 0xAALL;
+uint8_t channel = 25;
+uint64_t addr;
+uint8_t payload[PAY_SIZE];
+uint8_t payload_size;
+bool payload_encrypted = false;
+uint8_t payload_type = 0;
+uint16_t sequence;
 
 void nrf_spi_init(void)
 {
@@ -95,7 +116,112 @@ void nrf_read_register(uint8_t reg, uint8_t *out, size_t len)
     memcpy(out, &rx[1], len); // skip byte 0 — that slot returned STATUS, not data
 }
 
+void nrf_disable_crc(void)
+{
+    uint8_t config;
+    nrf_read_register(CMD_R_REGISTER, &config, 1);
+    config &= ~EN_CRC_BIT;
+    nrf_write_register(CMD_R_REGISTER, &config, 1);
+}
 
+void nrf_start_listening(void)
+{
+    // 1. set PWR_UP (bit 1), PRIM_RX (bit 0) in CONFIG - rw
+    uint8_t config;
+    nrf_read_register(CMD_R_REGISTER, &config, 1);
+    config |= (1 << 1) | (1 << 0); //PWR_UP | PRIM_RX
+    nrf_write_register(CMD_R_REGISTER, &config, 1);
+
+    // 2. flush the RX FIFO; this is SPI command byte, not a reg write
+    uint8_t flush_cmd = CMD_FLUSH_RX;
+    spi_transaction_t t = { .length = 8, .tx_buffer = &flush_cmd, .rx_buffer = NULL };
+    spi_device_transmit(nrf, &t);
+
+    // 3. clear any stale IRQ flags in STATUS (write 1 to clear RX_DR/TX_DS/MAX_RT)
+    uint8_t clear_status = 0x70;
+    nrf_write_register(REG_STATUS, &clear_status, 1);
+
+    // 4. bring CE pin high; this is a plain GPIO write, not SPI at all.
+    // CE physically switches the radio into active RX mode; everything above
+    // just configures *what* it'll do once CE goes high
+    gpio_set_level(PIN_CE, 1);
+
+    // 5. datashee specifies ~130us Standby-I -> RX settling time
+    vTaskDelay(pdMS_TO_TICKS(1));
+}
+
+
+void nrf_open_reading_pipe(int pipe, uint64_t prom_addr )
+{
+    uint8_t addr_bytes[3];
+    addr_bytes[0] = (prom_addr >> 0)  & 0xFF;  // LSB first
+    addr_bytes[1] = (prom_addr >> 8)  & 0xFF;
+    addr_bytes[2] = (prom_addr >> 16) & 0xFF;
+    // 1. Write the addr (3 bytes)
+    nrf_write_register(REG_RX_ADDR_P0, addr_bytes, 3);
+
+    // 2. Set expected payload width for pipe 0
+    uint8_t payload_width = 32; // To be adjusted (default: 32)
+    nrf_write_register(REG_RX_PW_P0, &payload_width, 1);
+
+    // 3. Enable pipe 0 in EN_RXADDR (0x02) - rw
+    uint8_t en_rxaddr;
+    nrf_read_register(REG_EN_RXADDR, &en_rxaddr, 1);
+    en_rxaddr |= (1 << pipe);
+    nrf_write_register(REG_EN_RXADDR, &en_rxaddr, 1);
+}
+
+void scan(void)
+{
+    ESP_LOGI(TAG, "Starting scan...\n");
+
+    int x, offset;
+    uint8_t buf[PKT_SIZE];
+    uint8_t wait = 100;
+    uint8_t payload_len;
+    uint16_t crc, crc_given;
+
+    /********************************
+     *  ORDER VERY IMPORTANT START  *
+     ********************************/
+    uint8_t en_aa_val = 0x00;
+    uint8_t rf_setup_val = 0x09;
+    uint8_t en_rxaddr_val = 0x00;
+    uint8_t setup_aw_val = 0x00;
+
+    nrf_write_register(REG_EN_AA, &en_aa_val, 1); // Disable auto ack on all(6) pipes
+    nrf_write_register(REG_RF_SETUP, &rf_setup_val, 1); // Disable PA, 2M rate, LNA enabled
+    
+
+    nrf_write_register(REG_EN_RXADDR, &en_rxaddr_val, 1);
+    nrf_write_register(REG_SETUP_AW, &setup_aw_val, 1);
+    nrf_open_reading_pipe(0, prom_addr);
+    nrf_start_listening();
+
+    while(1)
+    {
+        channel++;
+        if(channel > 84)
+        {
+            ESP_LOGI(TAG, "Starting channel sweep\n");
+            channel = 2;
+        }
+
+        if(channel == 4)
+        {
+            ESP_LOGI(TAG, "LOW\n");
+        }
+        if(channel == 42)
+        {
+            ESP_LOGI(TAG, "HIGH\n");
+        }
+        if(channel == 44)
+        {
+            ESP_LOGI(TAG, "LOW\n");
+        }
+        vTaskDelay(pdMS_TO_TICKS(1000));
+    }
+}
 
 void app_main(void)
 {
@@ -106,16 +232,6 @@ void app_main(void)
     uint8_t ret = nrf_read_status();
     ESP_LOGI(TAG, "read status %02x\n", ret);
 
-
-    uint8_t primer[5] = {0xAA, 0xAA, 0xAA, 0xAA, 0xAA};
-    uint8_t readback[5] = {0};
-
-    nrf_write_register(REG_RX_ADDR_P0, primer, 5);
-    nrf_read_register(REG_RX_ADDR_P0, readback, 5);
-
-    bool ok = memcmp(primer, readback, 5) == 0;
-    ESP_LOGI(TAG, "RX_ADDR_P0 primer test: %s (got %02X %02X %02X %02X %02X)",
-            ok ? "PASS" : "FAIL",
-            readback[0], readback[1], readback[2], readback[3], readback[4]);
+    scan();
     return;
 }
